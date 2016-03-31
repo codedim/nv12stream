@@ -2,6 +2,7 @@
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/times.h>
 #include <sstream>
 #include <fcntl.h>
 #include <errno.h>
@@ -15,6 +16,8 @@
 #define V4L2_BUF_TYPE_CAPTURE V4L2_BUF_TYPE_VIDEO_CAPTURE
 #endif
 
+#define CLEAR(x) memset(&(x), 0, sizeof(x))
+
 // constructor
 v4l2_frame::v4l2_frame(int dfile, int fwidth, int fheight)
 {
@@ -22,17 +25,21 @@ v4l2_frame::v4l2_frame(int dfile, int fwidth, int fheight)
     framewidth = fwidth;
     frameheight = fheight;
     devbuf_size = 0;
+    isCapturing = 0; // capturing mode flag
+    prevTick = 0.0;
 }
 
 // error handler
 void v4l2_frame::errno_exit(string err_str)
 {
-    cerr << "Error: " << err_str << ": " << errno << ", " << strerror(errno) << endl;
+    cerr << "Error: " << err_str << ": " << errno << ", " << 
+        strerror(errno) << endl;
     exit(EXIT_FAILURE);
 }
 
 // ioctl request handler
-int v4l2_frame::xioctl(int df, int request, void *arg)
+int v4l2_frame::xioctl(int df, int request, void *arg, 
+    string caller)
 {
        int res = ioctl(df, request, arg);
        if(res == -1)
@@ -40,7 +47,8 @@ int v4l2_frame::xioctl(int df, int request, void *arg)
            if (errno == EAGAIN) return EAGAIN;
 
            stringstream errstr;
-           errstr << "IoCtl Code: " << request << " ";
+           errstr << "Caller: " << caller << ", IoCtl Code: " << 
+                request << " ";
            errno_exit(errstr.str());
        }
 
@@ -50,18 +58,148 @@ int v4l2_frame::xioctl(int df, int request, void *arg)
 // retrievs frame from the device
 void* v4l2_frame::getFrame()
 {
-    startCapturing();
+//    startCapturing();
+    if (prevTick == 0.0) 
+    {
+        prevTick = tick_count();
+    }
 
     long int i = 0;
-    while(!waitFrame())
+    int buf_index;
+    while(!waitFrame(&buf_index))
     {
         sleep_ms(10); // let's the other jobs to execute
         i++;
     }
-    cerr << "debug iter == " << i << endl; // for debug
 
-    stopCapturing();
-    return (void *)devbuf;
+    // benchmarking
+    double tpf = tick_count() - prevTick;
+    cerr << " time per frame: " << tpf << "; fps: " << (1 / tpf) <<
+        "; in buf: " << buf_index << endl;
+    prevTick = tick_count();
+//    cerr << "debug iter == " << i << endl; // for debug
+
+//    stopCapturing();
+    return (void *)devbufs[buf_index];
+}
+
+int v4l2_frame::waitFrame(int *bufnmb)
+{
+    struct v4l2_buffer buf;
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (xioctl(devfile, VIDIOC_DQBUF, &buf, "waitFrame(1)") == EAGAIN)
+    {
+        cerr << ".";  // benchmarking
+        return 0;
+    }
+
+    *bufnmb = buf.index;
+    // previous buffer number to reinitialize
+    int reinit_buf = (*bufnmb == 0) ?
+        (DEV_BUF_COUNT - 1) : (*bufnmb - 1);
+    if (DEV_BUF_COUNT > 1 && isCapturing)
+        reinitBuffer(reinit_buf);
+
+/*
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = *bufnmb;
+    xioctl(devfile, VIDIOC_DQBUF, &buf, "waitFrame(2)");
+
+    if (*bufnmb == (DEV_BUF_COUNT - 1))
+    {
+cerr << "**** reinit ***" << endl;
+        restartCapturing();
+//        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+//        xioctl(devfile, VIDIOC_STREAMOFF, &type, "stopCapturing");
+//        xioctl(devfile, VIDIOC_STREAMON, &type, "startCapturing(2)");
+    }
+*/
+
+    isCapturing = 1; // set capturing mode flag
+    return 1;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+void v4l2_frame::reinitBuffer(int bufnmb)
+{
+    struct v4l2_buffer buf;
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = bufnmb;
+    xioctl(devfile, VIDIOC_QBUF, &buf, "restartCapturing(1)");
+}
+
+void v4l2_frame::startCapturing()
+{
+    int i;
+    struct v4l2_buffer buf;
+    for (i = 0; i < DEV_BUF_COUNT; ++i) 
+    {
+        CLEAR(buf);
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        xioctl(devfile, VIDIOC_QBUF, &buf, "startCapturing(1)");
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    xioctl(devfile, VIDIOC_STREAMON, &type, "startCapturing(2)");
+}
+
+void v4l2_frame::stopCapturing()
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    xioctl(devfile, VIDIOC_STREAMOFF, &type, "stopCapturing");
+    isCapturing = 0;
+}
+
+void v4l2_frame::initFrameBuffers()
+{
+    struct v4l2_requestbuffers req;
+    CLEAR(req);
+    req.count = DEV_BUF_COUNT;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    xioctl(devfile, VIDIOC_REQBUFS, &req, "initFrame(1)");
+cerr << "reqbufs: " << req.count << endl;
+
+    struct v4l2_buffer buf;
+    for (int i = 0; i < DEV_BUF_COUNT; ++i) 
+    {
+        devbufs[i] = (dev_buffer *) calloc(1, sizeof(dev_buffer));
+        if (!devbufs[i])
+            errno_exit("Fatal Error: Out of memory!");
+
+        CLEAR(buf);
+        buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory      = V4L2_MEMORY_MMAP;
+        buf.index       = i;
+        xioctl(devfile, VIDIOC_QUERYBUF, &buf, "initFrame(2)");
+
+        devbufs[i]->length = buf.length;
+        devbufs[i]->start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, 
+            MAP_SHARED, devfile, buf.m.offset);
+
+        if (devbufs[i]->start == MAP_FAILED)
+            errno_exit("Fatal Error: Init Frame fault!");
+    }
+}
+
+void v4l2_frame::freeFrameBuffers()
+{
+    for (int i = 0; i < DEV_BUF_COUNT; ++i) 
+    {
+        if (munmap(devbufs[i]->start, devbufs[i]->length) == -1)
+            errno_exit("Fatal Error: Free Frame fault!");
+        free(devbufs[i]);
+    }
 }
 
 // transcode device YUV4:2:2 packed frame to YUV4:2:0 planar frame
@@ -113,68 +251,7 @@ void* v4l2_frame::getNV12Frame(dev_buffer *db)
     return (void *) nv12buf;
 }
 
-int v4l2_frame::waitFrame()
-{
-    struct v4l2_buffer buf;
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    if (xioctl(devfile, VIDIOC_DQBUF, &buf) == EAGAIN)
-            return 0;
-
-    return 1;
-}
-
 /////////////////////////////////////////////////////////////////////////////
-
-void v4l2_frame::startCapturing()
-{
-    struct v4l2_buffer buf;
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = 0;
-    xioctl(devfile, VIDIOC_QBUF, &buf);
-
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(devfile, VIDIOC_STREAMON, &type);
-}
-
-void v4l2_frame::stopCapturing()
-{
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(devfile, VIDIOC_STREAMOFF, &type);
-}
-
-void v4l2_frame::initFrame()
-{
-    struct v4l2_requestbuffers req;
-    req.count = 1;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    xioctl(devfile, VIDIOC_REQBUFS, &req);
-
-    devbuf = (dev_buffer*) calloc(req.count, sizeof(dev_buffer));
-
-    struct v4l2_buffer buf;
-    buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.index       = 0;
-    xioctl(devfile, VIDIOC_QUERYBUF, &buf);
-
-    devbuf->length = buf.length;
-    devbuf->start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, 
-        MAP_SHARED, devfile, buf.m.offset);
-
-    if (devbuf->start == MAP_FAILED)
-        errno_exit("Fatal Error: Init Frame fault!");
-}
-
-void v4l2_frame::freeFrame()
-{
-    if (munmap(devbuf->start, devbuf->length) == -1)
-        errno_exit("Fatal Error: Free Frame fault!");
-
-    free(devbuf);
-}
 
 // sleep(ms) function
 void v4l2_frame::sleep_ms(unsigned long ms)
@@ -185,4 +262,12 @@ void v4l2_frame::sleep_ms(unsigned long ms)
     while(nanosleep(&req, &req) == -1)
         continue;
     return;
+}
+
+double v4l2_frame::tick_count()
+{
+    tms tm;
+    clock_t time = times(&tm);
+    long res = sysconf(_SC_CLK_TCK);
+    return (double)((float)time/(float)res);
 }

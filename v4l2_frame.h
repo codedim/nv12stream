@@ -2,6 +2,7 @@
 #define V4L2_FRAME_H
 
 #include <iostream>
+#include "v4l2_config.h"
 
 using namespace std;
 
@@ -14,8 +15,10 @@ class v4l2_frame
 {
 public:
     v4l2_frame(int dfile, int fwidth, int fheight);
-    void initFrame();
-    void freeFrame();
+    void initFrameBuffers();
+    void freeFrameBuffers();
+    void startCapturing();
+    void stopCapturing();
 
     // pointer to the dev_buffer (packed YUV 4:2:2)
     void* getFrame();
@@ -24,23 +27,26 @@ public:
 
 private:
     void errno_exit(string err_str);
-    int xioctl(int fd, int request, void *arg);
+    int xioctl(int fd, int request, void *arg, string caller);
+    int waitFrame(int *bufnmb);
+    void reinitBuffer(int bufnmb);
     void sleep_ms(unsigned long ms);
-//    void initMMAP();
-    void startCapturing();
-    int waitFrame();
-    void stopCapturing();
-//    void freeMMAP();
+    double tick_count(); // for benchmarking
 
     int devfile; // dev file
-    struct dev_buffer *devbuf;
+//    struct dev_buffer *devbuf;
     size_t devbuf_size;
+
+    dev_buffer * devbufs[DEV_BUF_COUNT];
+//    int bufcount; // amount of buffers to capture
 
     int framewidth;
     int frameheight;
 
+    int isCapturing;
+    double prevTick;    // for benchmarking
     struct dev_buffer *nv12buf;
-    void *nv12frame;
+//    void *nv12frame;
 };
 
 #endif // V4L2_FRAME_H

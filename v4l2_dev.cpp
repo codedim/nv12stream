@@ -15,6 +15,7 @@
 #define V4L2_BUF_TYPE_CAPTURE V4L2_BUF_TYPE_VIDEO_CAPTURE
 #endif
 
+
 // constructor
 v4l2_dev::v4l2_dev(string dev_name)
 {
